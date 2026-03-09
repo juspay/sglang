@@ -1318,6 +1318,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
+    # Memory relocation version - for invalidating CUDA graphs after HiCache relocates memory
+    hicache_memory_version: int = 0
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
@@ -2212,6 +2214,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+        # Propagate HiCache fields - use max version (most conservative for CUDA graph invalidation)
+        self.hicache_memory_version = max(
+            self.hicache_memory_version, other.hicache_memory_version
+        )
+        if other.hicache_consumer_index >= 0:
+            self.hicache_consumer_index = max(
+                self.hicache_consumer_index, other.hicache_consumer_index
+            )
+
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
@@ -2268,6 +2279,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
+            hicache_memory_version=self.hicache_memory_version,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
@@ -2460,6 +2472,7 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
+    hicache_memory_version: int = 0
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None

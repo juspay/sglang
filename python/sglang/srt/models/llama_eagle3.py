@@ -81,6 +81,8 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        if residual is not None:
+            hidden_states = hidden_states + residual
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
@@ -138,7 +140,12 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
+        self.layers = nn.ModuleList(
+            [
+                LlamaDecoderLayer(config, i, quant_config, prefix)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -167,13 +174,14 @@ class LlamaModel(nn.Module):
             return hidden_states, [hidden_states]
 
         residual = None
-        hidden_states, residual = self.midlayer(
-            positions,
-            embeds,
-            hidden_states,
-            forward_batch,
-            residual,
-        )
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions,
+                embeds,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
@@ -188,15 +196,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        draft_model_idx: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-
-        if self.config.num_hidden_layers != 1:
-            raise ValueError("EAGLE3 currently only supports 1 layer")
 
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
@@ -246,6 +252,10 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
             if "t2d" in name:
                 continue
+
+            # Backward compat: map old single-layer "midlayer.*" to "layers.0.*"
+            if "midlayer." in name:
+                name = name.replace("midlayer.", "layers.0.")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

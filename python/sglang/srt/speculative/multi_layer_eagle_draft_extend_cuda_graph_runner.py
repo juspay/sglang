@@ -249,6 +249,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
+        # Disable CUDA graph when hierarchical cache loading is active
+        if forward_batch.hicache_consumer_index >= 0:
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -477,11 +481,12 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                     forward_batch.req_to_token_pool.req_to_token,
                     self.eagle_worker.req_to_hidden_states_pool,
                 )
-                next_buffers.swa_out_cache_loc.copy_(
-                    self.model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        next_buffers.out_cache_loc
+                if hasattr(self.model_runner.token_to_kv_pool, 'translate_loc_from_full_to_swa'):
+                    next_buffers.swa_out_cache_loc.copy_(
+                        self.model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            next_buffers.out_cache_loc
+                        )
                     )
-                )
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup

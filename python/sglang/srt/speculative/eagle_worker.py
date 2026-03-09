@@ -706,6 +706,9 @@ class EAGLEWorker(TpModelWorker):
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
+        # Sync after KV cache allocation/assignment to ensure all GPU
+        # kernels from prepare_for_verify complete before the forward pass.
+        # torch.cuda.synchronize()  # commented out for perf
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
         batch.return_hidden_states = False
         batch.forward_mode = (
@@ -731,6 +734,12 @@ class EAGLEWorker(TpModelWorker):
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
+
+        # Sync GPU to prevent race between target verify forward and
+        # subsequent KV cache operations in spec_info.verify() when HiCache
+        # async load/evict may still be in-flight on a separate CUDA stream.
+        # torch.cuda.synchronize()  # commented out for perf
+
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -759,6 +768,9 @@ class EAGLEWorker(TpModelWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
+        # Sync before verify sampling to ensure target forward GPU work
+        # is complete before KV cache free/reallocation in verify().
+        # torch.cuda.synchronize()  # commented out for perf
         res: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,

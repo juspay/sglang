@@ -174,9 +174,24 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
     def init_lm_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        # Share the embedding and lm_head
         for i in range(self.speculative_num_steps):
-            self.draft_runner_list[i].model.set_embed_and_head(embed, head)
+            model = self.draft_runner_list[i].model
+            # EAGLE3 with compressed vocab: only share embedding, keep draft's own lm_head
+            if (
+                self.speculative_algorithm.is_eagle3()
+                and hasattr(model, "load_lm_head_from_target")
+                and not model.load_lm_head_from_target
+            ):
+                model.set_embed(embed)
+            else:
+                model.set_embed_and_head(embed, head)
+
+        # Initialize hot_token_id for EAGLE3 compressed vocab mapping
+        self.hot_token_id = None
+        if self.speculative_algorithm.is_eagle3():
+            draft_model = self.draft_runner_list[0].model
+            if hasattr(draft_model, 'hot_token_id') and draft_model.hot_token_id is not None:
+                self.hot_token_id = draft_model.hot_token_id.to(self.device)
 
     def init_attention_backend(self):
         # Create attn backends
@@ -403,6 +418,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             )
             probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
             # Chain-style: use this step's output hidden_states as next step's input
@@ -497,6 +514,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_p,
                     draft_logits_output.topk_index,
                 )
+                if self.hot_token_id is not None:
+                    ret_topk_index = self.hot_token_id[ret_topk_index]
             else:
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch, skip_attn_backend_init=True
@@ -506,6 +525,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     dim=-1,
                 )
                 ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                if self.hot_token_id is not None:
+                    ret_topk_index = self.hot_token_id[ret_topk_index]
                 if forward_batch.extend_seq_lens is not None:
                     rotate_input_ids_triton(
                         forward_batch.input_ids,
