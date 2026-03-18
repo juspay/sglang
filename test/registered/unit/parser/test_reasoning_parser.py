@@ -360,6 +360,24 @@ class TestKimiK2Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "<|tool_call_begin|>")
 
+    def test_detect_and_parse_thinking_end_token(self):
+        """Test that </thinking> is treated as an alternative end-of-reasoning token."""
+        text = "<think>reasoning content</thinking>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning content")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_streaming_thinking_end_token(self):
+        """Test streaming parse with </thinking> alternative end token."""
+        self.detector.parse_streaming_increment("<think>")
+        result1 = self.detector.parse_streaming_increment("reasoning")
+        self.assertEqual(result1.reasoning_text, "reasoning")
+        self.assertEqual(result1.normal_text, "")
+
+        result2 = self.detector.parse_streaming_increment("</thinking>normal text")
+        self.assertEqual(result2.reasoning_text, "")
+        self.assertEqual(result2.normal_text, "normal text")
+
 
 class TestGlm45Detector(CustomTestCase):
     """Test cases for GLM45 detector with tool interruption support."""

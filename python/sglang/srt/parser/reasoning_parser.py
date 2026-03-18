@@ -270,13 +270,17 @@ class KimiDetector(BaseReasoningFormatDetector):
 
 class KimiK2Detector(BaseReasoningFormatDetector):
     """
-    Detector for Kimi K2 models.
+    Detector for Kimi K2/K2.5 models.
     Assumes reasoning format:
       (<think>)*(.*)</think>
 
-    Kimi K2 can switch from reasoning to tool-call section with
+    Kimi K2/K2.5 can switch from reasoning to tool-call section with
     `<|tool_calls_section_begin|>` before emitting `</think>`.
+    Also handles `</thinking>` as an alternative end token that the model
+    sometimes hallucinates instead of `</think>`.
     """
+
+    _ALT_END_TOKEN = "</thinking>"
 
     def __init__(
         self,
@@ -294,6 +298,14 @@ class KimiK2Detector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
+
+    def detect_and_parse(self, text: str) -> "StreamingParseResult":
+        text = text.replace(self._ALT_END_TOKEN, self.think_end_token)
+        return super().detect_and_parse(text)
+
+    def parse_streaming_increment(self, new_text: str) -> "StreamingParseResult":
+        new_text = new_text.replace(self._ALT_END_TOKEN, self.think_end_token)
+        return super().parse_streaming_increment(new_text)
 
 
 class Glm45Detector(BaseReasoningFormatDetector):

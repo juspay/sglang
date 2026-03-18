@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 import uuid
 from http import HTTPStatus
@@ -57,6 +58,29 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+# Kimi K2/K2.5 degenerate output detection
+_SPECIAL_TOKEN_LEAK_RE = re.compile(r"<\|\S+?\|>")
+_HALLUCINATED_TOOL_CALL_MARKER = "<function_calls>"
+_HALLUCINATED_TOOL_CALL_THRESHOLD = 3
+
+
+def _detect_hallucinated_tool_calls_in_reasoning(text: str) -> bool:
+    """Detect degenerate hallucinated tool calls in reasoning content.
+
+    Kimi K2/K2.5 can sometimes hallucinate <function_calls> patterns
+    repeatedly in the reasoning block. 3+ occurrences indicates degeneracy.
+    """
+    if not text:
+        return False
+    return text.count(_HALLUCINATED_TOOL_CALL_MARKER) >= _HALLUCINATED_TOOL_CALL_THRESHOLD
+
+
+def _detect_special_tokens_in_text(text: str) -> bool:
+    """Detect leaked special tokens (e.g., <|some_token|>) in text."""
+    if not text:
+        return False
+    return bool(_SPECIAL_TOKEN_LEAK_RE.search(text))
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -630,6 +654,10 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls = {}
         finish_reasons = {}
 
+        # Kimi K2/K2.5 degenerate output tracking
+        accumulated_reasoning: Dict[int, str] = {}
+        content_ever_seen: Dict[int, bool] = {}
+
         # Usage tracking
         prompt_tokens = {}
         completion_tokens = {}
@@ -715,6 +743,24 @@ class OpenAIServingChat(OpenAIServingBase):
                         index, delta, reasoning_parser_dict, content, request
                     )
                     if reasoning_text:
+                        # Kimi K2/K2.5 degenerate output detection in streaming
+                        if self.reasoning_parser == "kimi_k2":
+                            accumulated_reasoning[index] = accumulated_reasoning.get(index, "") + reasoning_text
+                            if _detect_hallucinated_tool_calls_in_reasoning(accumulated_reasoning.get(index, "")):
+                                error = self.create_streaming_error_response(
+                                    "Detected degenerate hallucinated tool calls in reasoning output"
+                                )
+                                yield f"data: {error}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+                            if _detect_special_tokens_in_text(reasoning_text):
+                                error = self.create_streaming_error_response(
+                                    "Detected leaked special tokens in reasoning output"
+                                )
+                                yield f"data: {error}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
@@ -768,6 +814,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 else:
                     # Regular content
                     if delta:
+                        # Kimi K2/K2.5 special token leak detection in content
+                        if self.reasoning_parser == "kimi_k2":
+                            content_ever_seen[index] = True
+                            if _detect_special_tokens_in_text(delta):
+                                error = self.create_streaming_error_response(
+                                    "Detected leaked special tokens in content output"
+                                )
+                                yield f"data: {error}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(content=delta),
@@ -797,6 +854,30 @@ class OpenAIServingChat(OpenAIServingBase):
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
                 finish_reason_type = finish_reason_data["type"]
+
+                # Kimi K2/K2.5 reasoning fallback: if no content was ever seen
+                # and reasoning was accumulated, emit it as content
+                if (
+                    self.reasoning_parser == "kimi_k2"
+                    and not content_ever_seen.get(idx, False)
+                    and accumulated_reasoning.get(idx, "")
+                    and not has_tool_calls.get(idx, False)
+                ):
+                    fallback_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[
+                            ChatCompletionResponseStreamChoice(
+                                index=idx,
+                                delta=DeltaMessage(
+                                    content=accumulated_reasoning[idx]
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                        model=request.model,
+                    )
+                    yield f"data: {fallback_chunk.model_dump_json()}\n\n"
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
@@ -987,6 +1068,25 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                 )
+
+            # Kimi K2/K2.5 degenerate output detection and reasoning fallback
+            if self.reasoning_parser == "kimi_k2":
+                if _detect_hallucinated_tool_calls_in_reasoning(reasoning_text):
+                    return self.create_error_response(
+                        "Detected degenerate hallucinated tool calls in reasoning output",
+                        err_type="InternalServerError",
+                        status_code=500,
+                    )
+                if _detect_special_tokens_in_text(text) or _detect_special_tokens_in_text(reasoning_text):
+                    return self.create_error_response(
+                        "Detected leaked special tokens in model output",
+                        err_type="InternalServerError",
+                        status_code=500,
+                    )
+                # Reasoning fallback: if no content and no tool calls, use reasoning as content
+                if not text and reasoning_text and not tool_calls:
+                    text = reasoning_text
+                    reasoning_text = None
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,

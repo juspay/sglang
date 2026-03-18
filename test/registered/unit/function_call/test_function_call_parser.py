@@ -1159,6 +1159,69 @@ class TestKimiK2Detector(unittest.TestCase):
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"')
 
+    def test_tool_call_completion_waits_for_end_token(self):
+        """Test that a complete JSON payload does not finish the tool call before the end token."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+        ]
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+
+        # JSON is complete but no <|tool_call_end|> yet - tool should NOT be completed
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(self.detector.current_tool_id, 0)
+        self.assertTrue(self.detector.current_tool_name_sent)
+
+    def test_streaming_tool_call_ignores_trailing_section_whitespace(self):
+        """Test that post-tool-call structural whitespace never becomes normal text."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+            " ",
+            " ",
+        ]
+
+        normal_text_chunks = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal_text_chunks.append(result.normal_text)
+
+        # Trailing whitespace chunks should produce empty normal_text
+        cumulative_normal = "".join(normal_text_chunks)
+        self.assertEqual(cumulative_normal, "")
+        self.assertEqual(normal_text_chunks[-1], "")
+        self.assertEqual(normal_text_chunks[-2], "")
+
+    def test_hyphenated_function_name(self):
+        """Test parsing tool calls with hyphenated function names (MCP tools)."""
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.mcp-weather.get_forecast:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "mcp-weather.get_forecast")
+        self.assertEqual(result.calls[0].parameters, '{"city": "Paris"}')
+
+    def test_streaming_args_tracking_with_end_token_in_chunk(self):
+        """Test that argument tracking uses parsed_args_diff, not raw argument_diff."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        accumulated_params = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    accumulated_params += call.parameters
+        self.assertEqual(accumulated_params, '{"city": "Paris"}')
+
 
 class TestDeepSeekV3Detector(unittest.TestCase):
     def setUp(self):
