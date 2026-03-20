@@ -117,7 +117,15 @@ def handle_attention_cutlass_mla(attn, forward_batch):
 
 
 def handle_attention_fa4(attn, forward_batch):
-    # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
+    if is_in_piecewise_cuda_graph():
+        return AttnForwardMethod.MLA
+
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return _dispatch_mla_subtype(attn, forward_batch)
+
+    # FA4 uses MHA for extend mode
+    if _support_mha_one_shot(attn, forward_batch, "fa4"):
+        return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MHA_CHUNKED_KV
 
 
