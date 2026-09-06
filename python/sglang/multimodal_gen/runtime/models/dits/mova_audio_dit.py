@@ -1,8 +1,8 @@
 # Copied and adapted from: mossVG/mova/diffusion/models/wan_audio_dit.py
 # SPDX-License-Identifier: Apache-2.0
 #
-# NOTE: This module reuses common functions from mova_video_dit.py to reduce code duplication.
-# Audio-specific functions (precompute_freqs_cis_1d, legacy_precompute_freqs_cis_1d) are kept here.
+# NOTE: This module reuses common functions from mova_video_dit.py to reduce
+# code duplication. Audio-specific precompute_freqs_cis_1d is kept here.
 
 import math
 from typing import Any, Optional, Tuple
@@ -13,30 +13,19 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 
 # Reuse common functions and classes from mova_video_dit
 from .mova_video_dit import DiTBlock, precompute_freqs_cis, sinusoidal_embedding_1d
-
-
-# Audio-specific positional encoding functions
-def legacy_precompute_freqs_cis_1d(
-    dim: int,
-    end: int = 16384,
-    theta: float = 10000.0,
-    base_tps=4.0,
-    target_tps=44100 / 2048,
-):
-    s = float(base_tps) / float(target_tps)
-    # 1d rope precompute
-    f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta, s)
-    # No positional encoding is applied to the remaining dimensions
-    no_freqs_cis = precompute_freqs_cis(dim // 3, end, theta, s)
-    no_freqs_cis = torch.ones_like(no_freqs_cis)
-    return f_freqs_cis, no_freqs_cis, no_freqs_cis
 
 
 def precompute_freqs_cis_1d(dim: int, end: int = 16384, theta: float = 10000.0):
@@ -98,15 +87,19 @@ class Conv1dLocalIsland(nn.Conv1d):
             return super().forward(input)
 
 
-class WanAudioModel(CachableDiT, OffloadableDiTMixin):
-    _fsdp_shard_conditions = MOVAAudioConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVAAudioConfig()._compile_conditions
-    _supported_attention_backends = MOVAAudioConfig()._supported_attention_backends
+class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = MOVAAudioConfig().param_names_mapping
     reverse_param_names_mapping = MOVAAudioConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAAudioConfig().lora_param_names_mapping
 
-    def __init__(self, config: MOVAAudioConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: MOVAAudioConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
         # Extract parameters from config
@@ -122,7 +115,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         num_layers = config.num_layers
         has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
-        seperated_timestep = config.seperated_timestep
+        separated_timestep = config.separated_timestep
         require_vae_embedding = config.require_vae_embedding
         require_clip_embedding = config.require_clip_embedding
         fuse_vae_embedding_in_latents = config.fuse_vae_embedding_in_latents
@@ -131,7 +124,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         self.dim = dim
         self.freq_dim = freq_dim
         self.patch_size = patch_size
-        self.seperated_timestep = seperated_timestep
+        self.separated_timestep = separated_timestep
         self.require_vae_embedding = require_vae_embedding
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
@@ -142,13 +135,24 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
         self.text_embedding = MLP(
-            text_dim, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
+            text_dim,
+            dim,
+            output_dim=dim,
+            act_type="gelu_pytorch_tanh",
+            quant_config=quant_config,
         )
-        self.time_embedding = MLP(freq_dim, dim, output_dim=dim, act_type="silu")
+        self.time_embedding = MLP(
+            freq_dim, dim, output_dim=dim, act_type="silu", quant_config=quant_config
+        )
         # Preserve state_dict keys (time_projection.1.weight/bias).
-        self.time_projection = nn.Sequential(nn.SiLU(), ReplicatedLinear(dim, dim * 6))
+        self.time_projection = nn.Sequential(
+            nn.SiLU(), ReplicatedLinear(dim, dim * 6, quant_config=quant_config)
+        )
         self.blocks = nn.ModuleList(
-            [DiTBlock(dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
+            [
+                DiTBlock(dim, num_heads, ffn_dim, eps, quant_config=quant_config)
+                for _ in range(num_layers)
+            ]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
