@@ -240,6 +240,49 @@ def test_stream_end_drops_truncated_marker() -> None:
     assert text + (result.normal_text or "") == "all done"
 
 
+@pytest.mark.parametrize("chunk_size", [1, 5, 23])
+def test_streaming_never_leaks_tool_xtml_into_normal_text(chunk_size: int) -> None:
+    """A stream whose `<|open|>tools<|sep|>` marker is split such that tool-call
+    XTML is buffered before a complete tools-open is seen must not ship the
+    raw XTML markup to the client as visible text (the "tag leak" class the
+    kolu client hit against a Kimi-K3 plus sglang deployment). The tools
+    section may be lost, but its `<|open|>call ...`/`<|close|>call<|sep|>`
+    control tokens must never appear in `normal_text`."""
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    # Truncated tools-open marker (missing `s<|sep|>`) that precedes a complete
+    # call block; reproduces a chunk boundary splitting `<|open|>tools<|sep|>`.
+    text = (
+        "<|open|>tool"
+        + _call_block("python", 1, {"model": ("string", "litellm/kimi-k3")})
+        + TOOLS_CLOSE
+    )
+    text, calls = _stream(detector, _chunks(text, chunk_size), tools)
+    assert "<|open|>call" not in text
+    assert "<|close|>call<|sep|>" not in text
+    assert "<|open|>argument" not in text
+    assert "<|close|>argument<|sep|>" not in text
+    assert calls == []
+
+
+def test_streaming_leaked_call_tail_is_stripped() -> None:
+    """The tail of a tool call that reaches the streaming path without a
+    complete `<|open|>tools<|sep|>` marker (e.g. a second-round call on an
+    agent harness) is stripped rather than emitted verbatim. This is the exact
+    fragment observed leaking to a kolu client."""
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    leak = (
+        "<|close|>argument<|sep|>"
+        '<|open|>argument key="model" type="string"<|sep|>'
+        "litellm/kimi-k3<|close|>argument<|sep|>"
+        "<|close|>call<|sep|>"
+    )
+    text, calls = _stream(detector, [leak], tools)
+    assert text == ""
+    assert calls == []
+
+
 def test_detector_capabilities_and_registration() -> None:
     detector = KimiK3Detector()
     assert detector.supports_structural_tag()

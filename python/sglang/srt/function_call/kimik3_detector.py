@@ -13,6 +13,10 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.kimik3_format import (
+    ARGUMENT_CLOSE,
+    ARGUMENT_OPEN,
+    CALL_CLOSE,
+    CALL_OPEN,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -21,6 +25,7 @@ from sglang.srt.function_call.kimik3_format import (
     partial_suffix_len,
     strip_partial_marker_suffix,
     strip_response_wrappers,
+    strip_tool_markup,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
@@ -232,6 +237,40 @@ class KimiK3Detector(BaseFormatDetector):
         pending = self._emit_normal_text(limit=len(self._buffer))
         return StreamingParseResult(normal_text=strip_partial_marker_suffix(pending))
 
+    def _first_tool_marker(self, text: str) -> int:
+        """The index where the first tools-channel marker begins in `text`, or -1.
+
+        A marker is caught both when it has fully arrived and when it is still
+        mid-stream (e.g. `<|close|>argument` before its `<|sep|>` has landed) so
+        a chunk boundary cannot leak a partial tool tag into visible text. Any
+        such marker without a buffered, complete `<|open|>tools<|sep|>` is a
+        desync and never belongs in visible text, so `_emit_normal_text` stops
+        before it.
+        """
+        markers = (
+            CALL_OPEN,
+            ARGUMENT_OPEN,
+            CALL_CLOSE,
+            ARGUMENT_CLOSE,
+            TOOLS_OPEN,
+            TOOLS_CLOSE,
+        )
+        first = -1
+        for marker in markers:
+            # The full marker, wherever it lies in `text`.
+            idx = text.find(marker)
+            if idx != -1 and (first == -1 or idx < first):
+                first = idx
+            # A partial marker can only be a SUFFIX of the buffer (the stream
+            # has not delivered the bytes that would make it a marker yet); a
+            # suffix of `marker` that `marker` itself starts with.
+            for length in range(1, min(len(marker) - 1, len(text)) + 1):
+                if marker.startswith(text[-length:]):
+                    cand = len(text) - length
+                    if first == -1 or cand < first:
+                        first = cand
+        return first
+
     def _emit_normal_text(self, limit: int | None = None) -> str:
         if limit is None:
             holdback = partial_suffix_len(
@@ -239,11 +278,24 @@ class KimiK3Detector(BaseFormatDetector):
                 [self.bot_token, RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE],
             )
             limit = len(self._buffer) - holdback
+            # A partial `<|open|>tools<|sep|>` at the buffer tail is held by the
+            # suffix match above, but the tool section that follows it is a
+            # desync: its `<|open|>call ...` / argument and `<|close|>` fragments
+            # must be dropped, not streamed to the client as visible text. Cap
+            # the emission at the first tool marker so no in-band XTML escapes,
+            # and let `finish()` drop the held tail.
+            tool_start = self._first_tool_marker(self._buffer)
+            if tool_start != -1:
+                limit = min(limit, tool_start)
         if limit <= self._sent_normal_idx:
             return ""
         pending = self._buffer[self._sent_normal_idx : limit]
         for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
             if marker in pending:
                 pending = pending.replace(marker, "")
+        # A tool-call reaching this path is a desync (the enclosing
+        # `<|open|>tools<|sep|>` marker never made it into the buffer whole), so
+        # drop the XTML rather than ship it to the client as visible text.
+        pending = strip_tool_markup(pending)
         self._sent_normal_idx = limit
         return pending
